@@ -50,3 +50,4 @@ __pypackages__/
 .DS_Store
 .idea/
 .vscode/
+q_table.json

@@ -16,6 +16,9 @@ from pysec_scanner.scanner.vulnerabilities import (
     MissingCSRFTokenVulnerability
 )
 
+# RL Agent import
+from pysec_scanner.rl_agent import RLAgent
+
 # Reporting import
 from pysec_scanner.utils.reporting import print_scan_report
 
@@ -50,6 +53,16 @@ class Scanner:
         self.missing_csrf_vuln = MissingCSRFTokenVulnerability()
         
         self.processed_urls = set() # To avoid re-scanning same URL in more complex crawl scenarios
+
+        # Initialize RL Agent
+        self.rl_agent = RLAgent()
+        try:
+            self.rl_agent.load_q_table(filename="q_table.json") # Load pre-trained Q-table if exists
+            print("RL Agent: Q-table loaded successfully.")
+        except FileNotFoundError: # Handle if q_table.json does not exist
+            print("RL Agent: q_table.json not found. Starting with an empty Q-table.")
+        except Exception as e:
+            print(f"RL Agent: Error loading Q-table: {e}. Starting with an empty Q-table.")
 
     def discover_inputs_and_links(self, page_url: str, html_content: str) -> dict:
         """
@@ -139,34 +152,62 @@ class Scanner:
 
         discovered_elements = self.discover_inputs_and_links(page_url, html_content)
         
-        # --- URL Parameter Checks (SQLi, XSS) ---
-        if discovered_elements['url_params']:
-            print(f"  Checking URL parameters for SQLi/XSS: {discovered_elements['url_params']}")
-            # SQLi Check
-            sqli_finding = check_sqli(page_url, discovered_elements['url_params'], fetch_page)
-            if sqli_finding:
-                self.findings.append({
-                    'vulnerability_type': self.sqli_vuln.name,
-                    'cwe_id': self.sqli_vuln.cwe_id,
-                    'details': sqli_finding,
-                    'url': page_url, # The URL where params were tested, not necessarily the finding URL
-                    'criticality': self.sqli_vuln.default_criticality
-                })
-                print(f"    [!] SQLi vulnerability found: {sqli_finding['parameter']} in {page_url}")
+        # --- URL Parameter Checks (SQLi, XSS) using RL Agent ---
+        url_params_to_scan = discovered_elements.get('url_params', {})
+        if url_params_to_scan:
+            print(f"  RL Agent: Starting URL parameter checks for: {url_params_to_scan}")
+            for param_name, param_value in url_params_to_scan.items():
+                current_param_dict = {param_name: param_value}
+                # Ensure param_value is a string for get_state, as it might be a list from parse_qs
+                str_param_value = str(param_value[0] if isinstance(param_value, list) else param_value)
 
-            # XSS Check
-            xss_finding = check_xss(page_url, discovered_elements['url_params'], fetch_page)
-            if xss_finding:
-                self.findings.append({
-                    'vulnerability_type': self.xss_vuln.name,
-                    'cwe_id': self.xss_vuln.cwe_id,
-                    'details': xss_finding,
-                    'url': page_url, # As above
-                    'criticality': self.xss_vuln.default_criticality
-                })
-                print(f"    [!] XSS vulnerability found: {xss_finding['parameter']} in {page_url}")
+                state = self.rl_agent.get_state(param_name, str_param_value)
+                action_to_take = self.rl_agent.choose_action(state)
+                
+                reward = -0.1  # Default small cost for taking an action
+                vulnerability_found_this_action = False
+                
+                print(f"  RL Agent: State='{state}', Parameter='{param_name}', Value='{str_param_value}', Chosen Action='{action_to_take}'")
+
+                if action_to_take == "run_sqli":
+                    sqli_finding = check_sqli(page_url, current_param_dict, fetch_page)
+                    if sqli_finding:
+                        self.findings.append({
+                            'vulnerability_type': self.sqli_vuln.name,
+                            'cwe_id': self.sqli_vuln.cwe_id,
+                            'details': sqli_finding,
+                            'url': page_url, # Base URL where parameter was found
+                            'criticality': self.sqli_vuln.default_criticality
+                        })
+                        reward = 1.0 # Positive reward for finding a vulnerability
+                        vulnerability_found_this_action = True
+                        print(f"    [!] RL Agent: SQLi vulnerability found for parameter '{param_name}'. Reward: {reward}")
+                
+                elif action_to_take == "run_xss":
+                    xss_finding = check_xss(page_url, current_param_dict, fetch_page)
+                    if xss_finding:
+                        self.findings.append({
+                            'vulnerability_type': self.xss_vuln.name,
+                            'cwe_id': self.xss_vuln.cwe_id,
+                            'details': xss_finding,
+                            'url': page_url, # Base URL where parameter was found
+                            'criticality': self.xss_vuln.default_criticality
+                        })
+                        reward = 0.8 # Positive reward, slightly less than SQLi or same
+                        vulnerability_found_this_action = True
+                        print(f"    [!] RL Agent: XSS vulnerability found for parameter '{param_name}'. Reward: {reward}")
+                
+                else:
+                    print(f"  RL Agent: Unknown action '{action_to_take}' chosen for param '{param_name}'. No scan performed for this action.")
+                    # Optionally, assign a small negative reward for unknown actions if it implies a misconfiguration or an incomplete action set
+                    # reward = -0.5 
+
+                if not vulnerability_found_this_action and action_to_take in ["run_sqli", "run_xss"]:
+                    print(f"  RL Agent: No vulnerability found by {action_to_take} for parameter '{param_name}'. Reward: {reward}")
+                
+                self.rl_agent.update_q_table(state, action_to_take, reward)
         else:
-            print(f"  No URL parameters found in {page_url} for SQLi/XSS checks.")
+            print(f"  No URL parameters found in {page_url} for RL-based SQLi/XSS checks.")
 
 
         # --- CSRF Check (Page-level) ---
@@ -227,6 +268,13 @@ class Scanner:
 
         # Use the new reporting function
         print_scan_report(self.findings, self.base_url)
+
+        # Save the Q-table at the end of the scan
+        try:
+            self.rl_agent.save_q_table(filename="q_table.json")
+            print("RL Agent: Q-table saved successfully to q_table.json.")
+        except Exception as e:
+            print(f"RL Agent: Error saving Q-table: {e}")
 
 
 if __name__ == '__main__':
